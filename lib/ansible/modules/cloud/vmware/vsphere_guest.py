@@ -319,8 +319,10 @@ try:
 except ImportError:
     pass
 
+import re
 import ssl
-
+from natsort import natsorted
+# import pydevd
 
 def add_scsi_controller(module, s, config, devices, type="paravirtual", bus_num=0, disk_ctrl_key=1):
     # add a scsi controller
@@ -778,38 +780,75 @@ def deploy_template(vsphere_client, guest, resource_pool, template_src, esxi, mo
             msg="Could not clone selected machine: %s" % e
         )
 
-# example from https://github.com/kalazzerx/pysphere/blob/master/examples/pysphere_create_disk_and_add_to_vm.py
-# was used.
-def update_disks(vsphere_client, vm, module, vm_disk, changes):
-    request = VI.ReconfigVM_TaskRequestMsg()
+def update_disks(vsphere_client, vm, module, vm_disk, vm_hardware, changes):
     changed = False
 
+    controller_request = VI.ReconfigVM_TaskRequestMsg()
+    controller_devices = []
+    controller_type = 'paravirtual'
+    if vm_hardware and 'scsi' in vm_hardware:
+        controller_type = vm_hardware['scsi']
+
+    controller_spec = spec_singleton(False, controller_request, vm)
+
+    # Add necessary SCSI controllers if not ther
     for cnf_disk in vm_disk:
+        ctrl_id = 0
+        if 'controller' in vm_disk[cnf_disk]:
+          ctrl_id = vm_disk[cnf_disk]['controller']
+
+        found = False
+        controller_type_re = re.compile('(ParaVirtualSCSI|VirtualBusLogic|VirtualLsiLogic|VirtualLsiLogicSAS)Controller')
+        for dev_key in vm._devices:
+            if controller_type_re.match(vm._devices[dev_key]['type']):
+                scsi_ctrl_id = vm._devices[dev_key]['label'].split()[2]
+                if ctrl_id == int(scsi_ctrl_id):
+                    found = True
+                    break
+
+        # if not found - add it
+        if not found:
+            add_scsi_controller(
+                module, vsphere_client, controller_spec, controller_devices,
+                type=controller_type, disk_ctrl_key=str(1000 + ctrl_id), bus_num=ctrl_id)
+
+    # Now add missing disks
+    for cnf_disk in natsorted(vm_disk.keys()):
         disk_id = re.sub("disk", "", cnf_disk)
+        disk_type = vm_disk[cnf_disk]['type']
         found = False
         for dev_key in vm._devices:
             if vm._devices[dev_key]['type'] == 'VirtualDisk':
                 hdd_id = vm._devices[dev_key]['label'].split()[2]
                 if disk_id == hdd_id:
                     found = True
-                    continue
+                    break
+
         if not found:
-            it = VI.ReconfigVM_TaskRequestMsg()
-            _this = request.new__this(vm._mor)
-            _this.set_attribute_type(vm._mor.get_attribute_type())
-            request.set_element__this(_this)
-
-            spec = request.new_spec()
-
-            dc = spec.new_deviceChange()
+            # disk_request = VI.ReconfigVM_TaskRequestMsg()
+            # disk_spec = spec_singleton(False, disk_request, vm)
+            # pydevd.settrace('localhost', port=35911, stdoutToServer=True, stderrToServer=True)
+            
+            controller_spec = spec_singleton(controller_spec, controller_request, vm)
+            dc = controller_spec.new_deviceChange()
             dc.Operation = "add"
             dc.FileOperation = "create"
 
             hd = VI.ns0.VirtualDisk_Def("hd").pyclass()
             hd.Key = -100
-            hd.UnitNumber = int(disk_id)
+
+            unit_number = int(disk_id)
+            if 'unit' in vm_disk[cnf_disk]:
+                unit_number = vm_disk[cnf_disk]['unit']
+
+            hd.UnitNumber = unit_number
             hd.CapacityInKB = int(vm_disk[cnf_disk]['size_gb']) * 1024 * 1024
-            hd.ControllerKey = 1000
+
+            controller_id = 0
+            if 'controller' in vm_disk[cnf_disk]:
+                controller_id = vm_disk[cnf_disk]['controller']
+
+            hd.ControllerKey = 1000 + controller_id
 
             # module.fail_json(msg="peos : %s" % vm_disk[cnf_disk])
             backing = VI.ns0.VirtualDiskFlatVer2BackingInfo_Def("backing").pyclass()
@@ -817,30 +856,58 @@ def update_disks(vsphere_client, vm, module, vm_disk, changes):
             backing.DiskMode = "persistent"
             backing.Split = False
             backing.WriteThrough = False
-            backing.ThinProvisioned = False
+            if disk_type == 'thin':
+                backing.ThinProvisioned = True
+            else:
+                backing.ThinProvisioned = False
             backing.EagerlyScrub = False
             hd.Backing = backing
 
+            # description = VI.ns0.Description_Def("description").pyclass()
+            # description.Label = "Hard disk " + disk_id
+            # description.Summary = "Hard disk " + disk_id
+            # hd.DeviceInfo = description
+
             dc.Device = hd
+            controller_devices.append(dc)
+            
+            # disk_spec.DeviceChange = [dc]
+            # disk_request.set_element_spec(disk_spec)
 
-            spec.DeviceChange = [dc]
-            request.set_element_spec(spec)
+            # ret = vsphere_client._proxy.ReconfigVM_Task(disk_request)._returnval
 
-            ret = vsphere_client._proxy.ReconfigVM_Task(request)._returnval
+            # # Wait for the task to finish
+            # task = VITask(ret, vsphere_client)
+            # status = task.wait_for_state([task.STATE_SUCCESS,
+            #                               task.STATE_ERROR])
 
-            # Wait for the task to finish
-            task = VITask(ret, vsphere_client)
-            status = task.wait_for_state([task.STATE_SUCCESS,
-                                          task.STATE_ERROR])
+            # if status == task.STATE_SUCCESS:
+            #     changed = True
+            # elif status == task.STATE_ERROR:
+            #     module.fail_json(
+            #         msg="Error reconfiguring updating vm disks: %s, [%s]" % (
+            #             task.get_error_message(),
+            #             vm_disk))
 
-            if status == task.STATE_SUCCESS:
-                changed = True
-                changes[cnf_disk] = vm_disk[cnf_disk]
-            elif status == task.STATE_ERROR:
-                module.fail_json(
-                    msg="Error reconfiguring vm: %s, [%s]" % (
-                        task.get_error_message(),
-                        vm_disk[cnf_disk]))
+    if len(controller_devices) > 0:
+        controller_spec.DeviceChange = controller_devices
+        controller_request.set_element_spec(controller_spec)
+
+        ret = vsphere_client._proxy.ReconfigVM_Task(controller_request)._returnval
+
+        # Wait for the task to finish
+        task = VITask(ret, vsphere_client)
+        status = task.wait_for_state([task.STATE_SUCCESS,
+                                      task.STATE_ERROR])
+
+        if status == task.STATE_SUCCESS:
+            changed = True
+        elif status == task.STATE_ERROR:
+            module.fail_json(
+                msg="Error reconfiguring updating vm disks: %s, [%s]" % (
+                    task.get_error_message(),
+                    vm_disk))
+
     return changed, changes
 
 
@@ -858,7 +925,8 @@ def reconfigure_vm(vsphere_client, vm, module, esxi, resource_pool, cluster_name
     cpuHotRemoveEnabled = bool(vm.properties.config.cpuHotRemoveEnabled)
 
     changed, changes = update_disks(vsphere_client, vm,
-                                    module, vm_disk, changes)
+                                    module, vm_disk, vm_hardware, changes)
+    vm.properties._flush_cache()
     request = VI.ReconfigVM_TaskRequestMsg()
 
     # Change extra config
@@ -993,7 +1061,7 @@ def reconfigure_vm(vsphere_client, vm, module, esxi, resource_pool, cluster_name
         disk_num = 0
         dev_changes = []
         disks_changed = {}
-        for disk in sorted(vm_disk):
+        for disk in natsorted(vm_disk):
             try:
                 disksize = int(vm_disk[disk]['size_gb'])
                 # Convert the disk size to kilobytes
@@ -1675,7 +1743,9 @@ def main():
         'disk1': {
             'datastore': basestring,
             'size_gb': int,
-            'type': basestring
+            'type': basestring,
+            'controller': int,
+            'unit': int
         }
     }
 
