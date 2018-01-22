@@ -1,0 +1,12 @@
+---
+- hosts: all
+  gather_facts: no
+  remote_user: debian
+  become_method: sudo
+  become: true
+  tasks:
+    - pause:
+        prompt: Events Demo
+        type: redis
+        subscribe: master
+        wait_for: quit
