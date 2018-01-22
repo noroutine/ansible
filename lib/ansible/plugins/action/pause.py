@@ -22,6 +22,7 @@ import signal
 import termios
 import time
 import tty
+import redis
 
 from os import isatty
 from ansible.errors import AnsibleError
@@ -35,6 +36,11 @@ except ImportError:
     from ansible.utils.display import Display
     display = Display()
 
+config = {
+    'host': 'localhost',
+    'port': 6379,
+    'db': 0,
+}
 
 class AnsibleTimeoutExceeded(Exception):
     pass
@@ -47,7 +53,7 @@ def timeout_handler(signum, frame):
 class ActionModule(ActionBase):
     ''' pauses execution for a length or time, or until input is received '''
 
-    PAUSE_TYPES = ['seconds', 'minutes', 'prompt', 'echo', '']
+    PAUSE_TYPES = ['seconds', 'minutes', 'prompt', 'echo', 'redis', '']
     BYPASS_HOST_LOOP = True
 
     def run(self, tmp=None, task_vars=None):
@@ -73,10 +79,31 @@ class ActionModule(ActionBase):
             echo=echo
         ))
 
-        if not set(self._task.args.keys()) <= set(self.PAUSE_TYPES):
-            result['failed'] = True
-            result['msg'] = "Invalid argument given. Must be one of: %s" % ", ".join(self.PAUSE_TYPES)
-            return result
+        # if not set(self._task.args.keys()) <= set(self.PAUSE_TYPES):
+        #     result['failed'] = True
+        #     result['msg'] = "Invalid argument given. Must be one of: %s" % ", ".join(self.PAUSE_TYPES)
+        #     return result
+
+
+        r = redis.StrictRedis(**config)
+        sub_ch = self._task.args['subscribe']
+        wait_for = self._task.args['wait_for']
+
+        pubsub = r.pubsub()
+        pubsub.subscribe(sub_ch)
+        display.display('Listening for %s on %s ' % (wait_for, sub_ch))
+
+        redis_read = True
+        while redis_read: 
+            for item in pubsub.listen():
+                if item['data'] == wait_for:
+                    redis_read = False
+                    break
+                else:
+                    display.display(str(item['data']))
+
+        pubsub.unsubscribe()
+        return result
 
         # Should keystrokes be echoed to stdout?
         if 'echo' in self._task.args:
